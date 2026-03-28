@@ -14,6 +14,7 @@ import random
 from textblob import TextBlob
 from sqlalchemy.orm import Session
 from typing import Optional, List
+from sentiment_engine import analyze_full as sentiment_analyze_full
 
 from auth_endpoints import router as auth_router
 from database import init_db, get_db, AppointmentDB, SentimentLogDB, UserDB
@@ -497,66 +498,40 @@ def adjust_risk_by_sentiment(current_risk: float, sentiment: str, polarity: floa
 @app.post("/analyze-sentiment", response_model=SentimentResponse)
 async def analyze_patient_sentiment(request: SentimentRequest):
     """
-    PHASE 2: Sentiment Analysis Endpoint
+    PHASE 2 (Enhanced): Multi-layer Sentiment Analysis
     
-    Analyzes patient message sentiment and adjusts no-show risk accordingly.
-    Uses TextBlob for simple, effective sentiment analysis.
-    
-    Args:
-        request: SentimentRequest with message and currentRisk
-    
-    Returns:
-        SentimentResponse with sentiment, scores, and adjusted risk
+    Uses VADER + dental domain lexicon + negation handling + emotion classification.
+    Much more accurate than basic TextBlob for medical/dental context.
     """
-    
     try:
-        # Validate input
         if not request.message or len(request.message.strip()) == 0:
-            raise HTTPException(
-                status_code=400,
-                detail="Message cannot be empty"
-            )
-        
+            raise HTTPException(status_code=400, detail="Message cannot be empty")
         if request.currentRisk < 0 or request.currentRisk > 100:
-            raise HTTPException(
-                status_code=400,
-                detail="Current risk must be between 0 and 100"
-            )
-        
-        # Step 1: Analyze sentiment
-        sentiment_result = analyze_sentiment(request.message)
-        
-        # Step 2: Adjust risk based on sentiment
-        risk_adjustment = adjust_risk_by_sentiment(
-            request.currentRisk,
-            sentiment_result["sentiment"],
-            sentiment_result["polarity"]
-        )
-        
-        # Step 3: Prepare response
+            raise HTTPException(status_code=400, detail="Current risk must be between 0 and 100")
+
+        # Run full multi-layer analysis
+        result = sentiment_analyze_full(request.message, request.currentRisk)
+
         response = SentimentResponse(
-            sentiment=sentiment_result["sentiment"],
-            polarity=sentiment_result["polarity"],
-            subjectivity=sentiment_result["subjectivity"],
-            adjustedRisk=risk_adjustment["adjustedRisk"],
-            riskChange=risk_adjustment["riskChange"],
-            explanation=risk_adjustment["explanation"]
+            sentiment=result["sentiment"],
+            polarity=result["polarity"],
+            subjectivity=result["subjectivity"],
+            adjustedRisk=result["adjustedRisk"],
+            riskChange=result["riskChange"],
+            explanation=result["explanation"],
         )
-        
-        # Log for debugging
-        print(f"📝 Sentiment Analysis: '{request.message[:50]}...' → {sentiment_result['sentiment']} (polarity: {sentiment_result['polarity']})")
-        print(f"   Risk: {request.currentRisk}% → {risk_adjustment['adjustedRisk']}% (change: {risk_adjustment['riskChange']:+.1f}%)")
-        
+
+        print(f"📝 Enhanced Sentiment: '{request.message[:50]}' → {result['sentiment']} "
+              f"(VADER:{result['vaderScore']:.2f}, Domain:{result['domainScore']:.2f}, "
+              f"Fused:{result['polarity']:.2f}) | Emotions: {result['emotionList']}")
+
         return response
-        
+
     except HTTPException:
         raise
     except Exception as e:
         print(f"❌ Error in sentiment analysis: {e}")
-        raise HTTPException(
-            status_code=500,
-            detail=f"Error analyzing sentiment: {str(e)}"
-        )
+        raise HTTPException(status_code=500, detail=f"Error analyzing sentiment: {str(e)}")
 
 # ============================================================================
 # PHASE 3: Agentic Communication Analysis (Intent Detection)
@@ -736,66 +711,39 @@ def adjust_risk_by_intent(current_risk: float, intent: str, confidence: str):
 @app.post("/detect-intent", response_model=IntentResponse)
 async def detect_patient_intent(request: IntentRequest):
     """
-    PHASE 3: Intent Detection Endpoint
+    PHASE 3 (Enhanced): Multi-confidence Intent Detection
     
-    Detects patient intent from message and adjusts no-show risk accordingly.
-    Uses simple keyword-based pattern matching for intent classification.
-    
-    Args:
-        request: IntentRequest with message and currentRisk
-    
-    Returns:
-        IntentResponse with intent, confidence, and adjusted risk
+    Uses pattern matching with High/Medium/Low confidence levels,
+    detects multiple intents simultaneously, and applies weighted risk adjustment.
     """
-    
     try:
-        # Validate input
         if not request.message or len(request.message.strip()) == 0:
-            raise HTTPException(
-                status_code=400,
-                detail="Message cannot be empty"
-            )
-        
+            raise HTTPException(status_code=400, detail="Message cannot be empty")
         if request.currentRisk < 0 or request.currentRisk > 100:
-            raise HTTPException(
-                status_code=400,
-                detail="Current risk must be between 0 and 100"
-            )
-        
-        # Step 1: Detect intent
-        intent_result = detect_intent(request.message)
-        
-        # Step 2: Adjust risk based on intent
-        risk_adjustment = adjust_risk_by_intent(
-            request.currentRisk,
-            intent_result["intent"],
-            intent_result["confidence"]
-        )
-        
-        # Step 3: Prepare response
+            raise HTTPException(status_code=400, detail="Current risk must be between 0 and 100")
+
+        # Use the full engine for intent + risk
+        result = sentiment_analyze_full(request.message, request.currentRisk)
+
         response = IntentResponse(
-            intent=intent_result["intent"],
-            confidence=intent_result["confidence"],
-            adjustedRisk=risk_adjustment["adjustedRisk"],
-            riskChange=risk_adjustment["riskChange"],
-            explanation=risk_adjustment["explanation"],
-            keywords=intent_result["keywords"]
+            intent=result["intent"],
+            confidence=result["intentConfidence"],
+            adjustedRisk=result["adjustedRisk"],
+            riskChange=result["riskChange"],
+            explanation=result["explanation"],
+            keywords=result["intentKeywords"],
         )
-        
-        # Log for debugging
-        print(f"🎯 Intent Detection: '{request.message[:50]}...' → {intent_result['intent']} ({intent_result['confidence']} confidence)")
-        print(f"   Risk: {request.currentRisk}% → {risk_adjustment['adjustedRisk']}% (change: {risk_adjustment['riskChange']:+.1f}%)")
-        
+
+        print(f"🎯 Enhanced Intent: '{request.message[:50]}' → {result['intent']} "
+              f"({result['intentConfidence']}) | Risk: {request.currentRisk}% → {result['adjustedRisk']}%")
+
         return response
-        
+
     except HTTPException:
         raise
     except Exception as e:
         print(f"❌ Error in intent detection: {e}")
-        raise HTTPException(
-            status_code=500,
-            detail=f"Error detecting intent: {str(e)}"
-        )
+        raise HTTPException(status_code=500, detail=f"Error detecting intent: {str(e)}")
 
 # ============================================================================
 
@@ -806,6 +754,33 @@ if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
 
+
+# ============================================================================
+# ENHANCED SENTIMENT ANALYSIS ENDPOINT (full response)
+# ============================================================================
+
+class FullSentimentRequest(BaseModel):
+    message: str
+    currentRisk: float = 50.0
+
+@app.post("/analyze-full")
+async def analyze_full_sentiment(request: FullSentimentRequest):
+    """
+    Full multi-layer sentiment analysis returning all signals:
+    - VADER score, domain score, fused polarity
+    - Emotion classification (anxiety, satisfaction, frustration, trust, urgency, pain)
+    - Intent detection with all detected intents and confidence
+    - Risk adjustment breakdown
+    """
+    try:
+        if not request.message.strip():
+            raise HTTPException(status_code=400, detail="Message cannot be empty")
+        result = sentiment_analyze_full(request.message, request.currentRisk)
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 # ============================================================================
 # DATABASE-BACKED ENDPOINTS
