@@ -1,41 +1,51 @@
 """
 FastAPI Backend Server
-This is the main API server that handles requests from the frontend
-and returns AI predictions using the trained neural network model.
-
-Uses scikit-learn's MLPClassifier (Multi-Layer Perceptron Neural Network)
+AI-powered dental appointment prediction system with SQLite database
 """
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import joblib
 import numpy as np
 from datetime import datetime
 import os
-import random  # NEW: For generating synthetic real-time data
-from textblob import TextBlob  # PHASE 2: For sentiment analysis
-from auth_endpoints import router as auth_router  # PHASE 4: Authentication
+import random
+from textblob import TextBlob
+from sqlalchemy.orm import Session
+from typing import Optional, List
 
-# Create FastAPI application instance
+from auth_endpoints import router as auth_router
+from database import init_db, get_db, AppointmentDB, SentimentLogDB, UserDB
+from auth import seed_demo_users
+
 app = FastAPI(
     title="Smart DentalOps API",
     description="AI-powered dental appointment prediction system",
-    version="1.0.0"
+    version="2.0.0"
 )
 
-# Enable CORS (Cross-Origin Resource Sharing)
-# This allows frontend (port 5173) to communicate with backend (port 8000)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # In production, specify exact origins
+    allow_origins=["*"],
     allow_credentials=True,
-    allow_methods=["*"],  # Allow all HTTP methods
-    allow_headers=["*"],  # Allow all headers
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
-# Include authentication router (PHASE 4)
 app.include_router(auth_router)
+
+# ── Startup: init DB and seed demo users ──────────────────────────────────────
+@app.on_event("startup")
+def startup():
+    init_db()
+    from database import SessionLocal
+    db = SessionLocal()
+    try:
+        seed_demo_users(db)
+    finally:
+        db.close()
+    print("✅ Database initialized and demo users seeded")
 
 # Load the trained ANN model and scaler
 # This happens once when server starts, not on every request
@@ -792,6 +802,232 @@ async def detect_patient_intent(request: IntentRequest):
 # Run the server
 # Command: uvicorn main:app --reload
 # The server will run on http://localhost:8000
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
+
+
+# ============================================================================
+# DATABASE-BACKED ENDPOINTS
+# ============================================================================
+
+# ── Appointment models ────────────────────────────────────────────────────────
+
+class AppointmentCreate(BaseModel):
+    patient_name: str
+    age: int = 30
+    procedure_type: str = "Cleaning"
+    risk_score: float = 0.0
+    slot_type: str = "Standard Slot"
+    slot_time: str = "10:00 AM"
+    status: str = "Scheduled"
+    dentist: str = "Dr. Smith"
+    chair: str = "Chair 1"
+    duration: str = "30 min"
+    notes: str = ""
+
+class AppointmentUpdate(BaseModel):
+    status: Optional[str] = None
+    notes: Optional[str] = None
+    dentist: Optional[str] = None
+    slot_time: Optional[str] = None
+
+def apt_to_dict(a: AppointmentDB) -> dict:
+    return {
+        "id": a.id, "patientName": a.patient_name, "patientId": a.patient_id,
+        "age": a.age, "procedureType": a.procedure_type, "riskScore": a.risk_score,
+        "slotType": a.slot_type, "slotTime": a.slot_time, "status": a.status,
+        "dentist": a.dentist, "chair": a.chair, "duration": a.duration,
+        "notes": a.notes, "createdAt": a.created_at.isoformat() if a.created_at else None,
+    }
+
+# ── GET /appointments ─────────────────────────────────────────────────────────
+
+@app.get("/appointments")
+async def get_appointments(
+    status: Optional[str] = None,
+    dentist: Optional[str] = None,
+    limit: int = 50,
+    db: Session = Depends(get_db)
+):
+    """Get all appointments from DB with optional filters"""
+    q = db.query(AppointmentDB)
+    if status:
+        q = q.filter(AppointmentDB.status == status)
+    if dentist:
+        q = q.filter(AppointmentDB.dentist == dentist)
+    appointments = q.order_by(AppointmentDB.created_at.desc()).limit(limit).all()
+    return {"appointments": [apt_to_dict(a) for a in appointments], "total": len(appointments)}
+
+# ── POST /appointments ────────────────────────────────────────────────────────
+
+@app.post("/appointments")
+async def create_appointment(data: AppointmentCreate, db: Session = Depends(get_db)):
+    """Create a new appointment in DB"""
+    patient_id = f"#SDO-{random.randint(1000, 9999)}"
+    apt = AppointmentDB(
+        patient_name=data.patient_name,
+        patient_id=patient_id,
+        age=data.age,
+        procedure_type=data.procedure_type,
+        risk_score=data.risk_score,
+        slot_type=data.slot_type,
+        slot_time=data.slot_time,
+        status=data.status,
+        dentist=data.dentist,
+        chair=data.chair,
+        duration=data.duration,
+        notes=data.notes,
+        created_at=datetime.now(),
+    )
+    db.add(apt)
+    db.commit()
+    db.refresh(apt)
+    return apt_to_dict(apt)
+
+# ── PATCH /appointments/{id} ──────────────────────────────────────────────────
+
+@app.patch("/appointments/{apt_id}")
+async def update_appointment(apt_id: int, data: AppointmentUpdate, db: Session = Depends(get_db)):
+    """Update appointment status or notes"""
+    apt = db.query(AppointmentDB).filter(AppointmentDB.id == apt_id).first()
+    if not apt:
+        raise HTTPException(status_code=404, detail="Appointment not found")
+    if data.status is not None:
+        apt.status = data.status
+    if data.notes is not None:
+        apt.notes = data.notes
+    if data.dentist is not None:
+        apt.dentist = data.dentist
+    if data.slot_time is not None:
+        apt.slot_time = data.slot_time
+    apt.updated_at = datetime.now()
+    db.commit()
+    db.refresh(apt)
+    return apt_to_dict(apt)
+
+# ── DELETE /appointments/{id} ─────────────────────────────────────────────────
+
+@app.delete("/appointments/{apt_id}")
+async def delete_appointment(apt_id: int, db: Session = Depends(get_db)):
+    """Delete an appointment"""
+    apt = db.query(AppointmentDB).filter(AppointmentDB.id == apt_id).first()
+    if not apt:
+        raise HTTPException(status_code=404, detail="Appointment not found")
+    db.delete(apt)
+    db.commit()
+    return {"message": "Appointment deleted"}
+
+# ── GET /analytics/summary ────────────────────────────────────────────────────
+
+@app.get("/analytics/summary")
+async def get_analytics_summary(db: Session = Depends(get_db)):
+    """Real analytics from DB"""
+    all_apts = db.query(AppointmentDB).all()
+    total = len(all_apts)
+
+    if total == 0:
+        # Return synthetic data if DB is empty
+        return {
+            "totalAppointments": 1284,
+            "todayAppointments": 24,
+            "highRiskCount": 12,
+            "averageRisk": 35.2,
+            "chairUtilization": 72,
+            "noShowRate": 4.8,
+            "monthlyRevenue": 42500,
+            "source": "synthetic"
+        }
+
+    high_risk = sum(1 for a in all_apts if a.risk_score > 70)
+    avg_risk = round(sum(a.risk_score for a in all_apts) / total, 1)
+    in_progress = sum(1 for a in all_apts if a.status == "In Progress")
+    chair_util = round((in_progress / max(5, 1)) * 100, 1)
+    cancelled = sum(1 for a in all_apts if a.status == "Cancelled")
+    no_show_rate = round((cancelled / total) * 100, 1) if total > 0 else 0
+
+    # Dentist workload
+    dentist_counts = {}
+    for a in all_apts:
+        dentist_counts[a.dentist] = dentist_counts.get(a.dentist, 0) + 1
+
+    # Procedure breakdown
+    procedure_counts = {}
+    for a in all_apts:
+        procedure_counts[a.procedure_type] = procedure_counts.get(a.procedure_type, 0) + 1
+
+    return {
+        "totalAppointments": total,
+        "todayAppointments": total,
+        "highRiskCount": high_risk,
+        "averageRisk": avg_risk,
+        "chairUtilization": chair_util,
+        "noShowRate": no_show_rate,
+        "monthlyRevenue": total * 150,
+        "dentistWorkload": dentist_counts,
+        "procedureBreakdown": procedure_counts,
+        "source": "database"
+    }
+
+# ── POST /sentiment-log ───────────────────────────────────────────────────────
+
+@app.post("/sentiment-log")
+async def log_sentiment(
+    patient_name: str,
+    message: str,
+    sentiment: str,
+    polarity: float,
+    subjectivity: float,
+    intent: str,
+    confidence: str,
+    risk_before: float,
+    risk_after: float,
+    db: Session = Depends(get_db)
+):
+    """Save sentiment analysis result to DB"""
+    log = SentimentLogDB(
+        patient_name=patient_name,
+        message=message,
+        sentiment=sentiment,
+        polarity=polarity,
+        subjectivity=subjectivity,
+        intent=intent,
+        confidence=confidence,
+        risk_before=risk_before,
+        risk_after=risk_after,
+        created_at=datetime.now(),
+    )
+    db.add(log)
+    db.commit()
+    return {"message": "Logged successfully"}
+
+# ── GET /sentiment-logs ───────────────────────────────────────────────────────
+
+@app.get("/sentiment-logs")
+async def get_sentiment_logs(limit: int = 20, db: Session = Depends(get_db)):
+    """Get sentiment analysis history from DB"""
+    logs = db.query(SentimentLogDB).order_by(SentimentLogDB.created_at.desc()).limit(limit).all()
+    return [{
+        "id": l.id, "patientName": l.patient_name, "message": l.message[:100],
+        "sentiment": l.sentiment, "polarity": l.polarity, "intent": l.intent,
+        "confidence": l.confidence, "riskBefore": l.risk_before, "riskAfter": l.risk_after,
+        "createdAt": l.created_at.isoformat() if l.created_at else None,
+    } for l in logs]
+
+# ── GET /db-stats ─────────────────────────────────────────────────────────────
+
+@app.get("/db-stats")
+async def get_db_stats(db: Session = Depends(get_db)):
+    """Quick DB health check"""
+    return {
+        "users": db.query(UserDB).count(),
+        "appointments": db.query(AppointmentDB).count(),
+        "sentiment_logs": db.query(SentimentLogDB).count(),
+        "database": "SQLite (persistent)",
+    }
+
+# ── Run ───────────────────────────────────────────────────────────────────────
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)

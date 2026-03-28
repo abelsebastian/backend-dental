@@ -1,225 +1,111 @@
 """
-Authentication Endpoints for Smart DentalOps
-Add these endpoints to main.py
+Authentication Endpoints - SQLite backed
 """
 
 from fastapi import APIRouter, HTTPException, Depends, status, Header
 from datetime import timedelta
 from typing import Optional
+from sqlalchemy.orm import Session
+
+from database import get_db
 from auth import (
     UserCreate, UserLogin, User, Token, TokenData,
     create_user, authenticate_user, create_access_token,
-    decode_token, get_user_by_email, ACCESS_TOKEN_EXPIRE_MINUTES,
-    DEMO_USERS
+    decode_token, get_user_by_email,
+    ACCESS_TOKEN_EXPIRE_MINUTES, DEMO_USERS
 )
 
-# Create router
 router = APIRouter(prefix="/auth", tags=["authentication"])
 
-# Helper function to extract token from Authorization header
-def get_token_from_header(authorization: Optional[str] = Header(None)) -> str:
-    """Extract bearer token from Authorization header"""
+
+def get_token(authorization: Optional[str] = Header(None)) -> str:
     if not authorization:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Missing authorization header",
-            headers={"WWW-Authenticate": "Bearer"}
-        )
-    
+        raise HTTPException(status_code=401, detail="Missing authorization header")
     parts = authorization.split()
     if len(parts) != 2 or parts[0].lower() != "bearer":
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid authorization header format",
-            headers={"WWW-Authenticate": "Bearer"}
-        )
-    
+        raise HTTPException(status_code=401, detail="Invalid authorization header format")
     return parts[1]
 
-# ============================================================================
-# AUTHENTICATION ENDPOINTS
-# ============================================================================
+
+# ── Register ──────────────────────────────────────────────────────────────────
 
 @router.post("/register", response_model=User)
-async def register(user: UserCreate):
-    """
-    Register a new user
-    
-    Args:
-        user: UserCreate object with email, full_name, password, role
-    
-    Returns:
-        User object
-    """
+async def register(user: UserCreate, db: Session = Depends(get_db)):
     try:
-        new_user = create_user(user)
-        return new_user
+        return create_user(user, db)
     except ValueError as e:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=str(e)
-        )
+        raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Error creating user: {str(e)}"
-        )
+        raise HTTPException(status_code=500, detail=f"Error creating user: {str(e)}")
+
+
+# ── Login ─────────────────────────────────────────────────────────────────────
 
 @router.post("/login", response_model=Token)
-async def login(credentials: UserLogin):
-    """
-    Login user and return JWT token
-    
-    Args:
-        credentials: UserLogin object with email and password
-    
-    Returns:
-        Token object with access_token, token_type, and user
-    """
-    user = authenticate_user(credentials.email, credentials.password)
-    
+async def login(credentials: UserLogin, db: Session = Depends(get_db)):
+    user = authenticate_user(credentials.email, credentials.password, db)
     if not user:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid email or password",
-            headers={"WWW-Authenticate": "Bearer"}
-        )
-    
-    # Create access token
-    access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+        raise HTTPException(status_code=401, detail="Invalid email or password")
+
     access_token = create_access_token(
         data={"sub": user["email"], "role": user["role"]},
-        expires_delta=access_token_expires
+        expires_delta=timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
     )
-    
-    # Return token and user info
-    return Token(
-        access_token=access_token,
-        token_type="bearer",
-        user=User(**user)
-    )
+    return Token(access_token=access_token, token_type="bearer", user=User(**user))
+
+
+# ── Logout ────────────────────────────────────────────────────────────────────
 
 @router.post("/logout")
 async def logout(authorization: Optional[str] = Header(None)):
-    """
-    Logout user (invalidate token)
-    
-    Note: In production, add token to blacklist
-    """
-    token = get_token_from_header(authorization)
+    get_token(authorization)
     return {"message": "Logged out successfully"}
 
+
+# ── Get current user ──────────────────────────────────────────────────────────
+
 @router.get("/me", response_model=User)
-async def get_current_user(authorization: Optional[str] = Header(None)):
-    """
-    Get current logged-in user
-    
-    Args:
-        authorization: Bearer token in Authorization header
-    
-    Returns:
-        Current user object
-    """
-    token = get_token_from_header(authorization)
+async def get_current_user(authorization: Optional[str] = Header(None), db: Session = Depends(get_db)):
+    token = get_token(authorization)
     token_data = decode_token(token)
-    
-    if token_data is None:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid token",
-            headers={"WWW-Authenticate": "Bearer"}
-        )
-    
-    user = get_user_by_email(token_data.email)
-    
-    if user is None:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="User not found"
-        )
-    
+    if not token_data:
+        raise HTTPException(status_code=401, detail="Invalid token")
+    user = get_user_by_email(token_data.email, db)
+    if not user:
+        raise HTTPException(status_code=401, detail="User not found")
     return User(**user)
 
+
+# ── Refresh token ─────────────────────────────────────────────────────────────
+
 @router.post("/refresh-token", response_model=Token)
-async def refresh_token(authorization: Optional[str] = Header(None)):
-    """
-    Refresh access token
-    
-    Args:
-        authorization: Current bearer token in Authorization header
-    
-    Returns:
-        New token object
-    """
-    token = get_token_from_header(authorization)
+async def refresh_token(authorization: Optional[str] = Header(None), db: Session = Depends(get_db)):
+    token = get_token(authorization)
     token_data = decode_token(token)
-    
-    if token_data is None:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid token"
-        )
-    
-    user = get_user_by_email(token_data.email)
-    
-    if user is None:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="User not found"
-        )
-    
-    # Create new access token
-    access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
-    access_token = create_access_token(
-        data={"sub": user["email"], "role": user["role"]},
-        expires_delta=access_token_expires
-    )
-    
-    return Token(
-        access_token=access_token,
-        token_type="bearer",
-        user=User(**user)
-    )
+    if not token_data:
+        raise HTTPException(status_code=401, detail="Invalid token")
+    user = get_user_by_email(token_data.email, db)
+    if not user:
+        raise HTTPException(status_code=401, detail="User not found")
+    access_token = create_access_token(data={"sub": user["email"], "role": user["role"]})
+    return Token(access_token=access_token, token_type="bearer", user=User(**user))
+
+
+# ── Demo credentials ──────────────────────────────────────────────────────────
 
 @router.get("/demo-credentials")
 async def get_demo_credentials():
-    """
-    Get demo credentials for testing
-    
-    Returns:
-        Dictionary with demo user credentials
-    """
-    return {
-        "message": "Demo credentials for testing",
-        "users": DEMO_USERS
-    }
+    return {"message": "Demo credentials for testing", "users": DEMO_USERS}
 
-# ============================================================================
-# PROTECTED ENDPOINTS EXAMPLE
-# ============================================================================
 
-@router.get("/protected-example")
-async def protected_endpoint(authorization: Optional[str] = Header(None)):
-    """
-    Example of a protected endpoint
-    
-    Args:
-        authorization: Bearer token in Authorization header
-    
-    Returns:
-        Protected data
-    """
-    token = get_token_from_header(authorization)
+# ── List all users (admin only) ───────────────────────────────────────────────
+
+@router.get("/users")
+async def list_users(authorization: Optional[str] = Header(None), db: Session = Depends(get_db)):
+    token = get_token(authorization)
     token_data = decode_token(token)
-    
-    if token_data is None:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid token"
-        )
-    
-    return {
-        "message": f"Hello {token_data.email}",
-        "role": token_data.role,
-        "data": "This is protected data"
-    }
+    if not token_data or token_data.role != "admin":
+        raise HTTPException(status_code=403, detail="Admin access required")
+    from database import UserDB
+    users = db.query(UserDB).all()
+    return [{"id": u.id, "email": u.email, "full_name": u.full_name, "role": u.role, "is_active": u.is_active, "created_at": u.created_at} for u in users]

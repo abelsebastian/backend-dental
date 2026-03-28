@@ -35,3 +35,6 @@ python-jose[cryptography]>=3.3.0
 # Email validation
 email-validator>=1.1.5
 
+# Database
+sqlalchemy>=2.0.0
+
