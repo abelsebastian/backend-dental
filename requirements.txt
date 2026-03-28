@@ -40,3 +40,8 @@ email-validator>=1.1.5
 # Database
 sqlalchemy>=2.0.0
 
+# Security implementation (Phase 4)
+passlib[bcrypt]>=1.7.4
+
+# Environment variables loading
+python-dotenv>=1.0.0

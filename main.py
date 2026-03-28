@@ -17,7 +17,7 @@ from typing import Optional, List
 from sentiment_engine import analyze_full as sentiment_analyze_full
 
 from auth_endpoints import router as auth_router
-from database import init_db, get_db, AppointmentDB, SentimentLogDB, UserDB
+from database import init_db, get_db, AppointmentDB, SentimentLogDB, UserDB, WaitlistDB, NotificationLogDB, DoctorDB
 from auth import seed_demo_users
 
 app = FastAPI(
@@ -44,9 +44,10 @@ def startup():
     db = SessionLocal()
     try:
         seed_demo_users(db)
+        seed_demo_doctors(db)
     finally:
         db.close()
-    print("✅ Database initialized and demo users seeded")
+    print("✅ Database initialized, demo users and doctors seeded")
 
 # Load the trained ANN model and scaler
 # This happens once when server starts, not on every request
@@ -747,14 +748,6 @@ async def detect_patient_intent(request: IntentRequest):
 
 # ============================================================================
 
-# Run the server
-# Command: uvicorn main:app --reload
-# The server will run on http://localhost:8000
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
-
-
 # ============================================================================
 # ENHANCED SENTIMENT ANALYSIS ENDPOINT (full response)
 # ============================================================================
@@ -1000,6 +993,487 @@ async def get_db_stats(db: Session = Depends(get_db)):
         "sentiment_logs": db.query(SentimentLogDB).count(),
         "database": "SQLite (persistent)",
     }
+
+# ── Run ───────────────────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
+
+
+# ============================================================================
+# DOCTOR SEEDING
+# ============================================================================
+
+def seed_demo_doctors(db: Session):
+    """Seed demo doctors if none exist"""
+    if db.query(DoctorDB).count() == 0:
+        doctors = [
+            DoctorDB(name="Dr. Julian Vance", specialty="General Dentistry", email="vance@dentalops.com", phone="+1-555-0101"),
+            DoctorDB(name="Dr. Sarah Chen", specialty="Orthodontics", email="chen@dentalops.com", phone="+1-555-0102"),
+            DoctorDB(name="Dr. Marcus Thorne", specialty="Endodontics", email="thorne@dentalops.com", phone="+1-555-0103"),
+            DoctorDB(name="Dr. Elena Rodriguez", specialty="Oral Surgery", email="rodriguez@dentalops.com", phone="+1-555-0104"),
+        ]
+        for d in doctors:
+            db.add(d)
+        db.commit()
+        print("✅ Demo doctors seeded")
+
+
+# ============================================================================
+# DOCTORS ENDPOINTS
+# ============================================================================
+
+@app.get("/doctors")
+async def get_doctors(specialty: Optional[str] = None, db: Session = Depends(get_db)):
+    """List all active doctors with optional specialty filter"""
+    q = db.query(DoctorDB).filter(DoctorDB.is_active == True)
+    if specialty:
+        q = q.filter(DoctorDB.specialty.ilike(f"%{specialty}%"))
+    doctors = q.all()
+    return [{
+        "id": d.id, "name": d.name, "specialty": d.specialty,
+        "email": d.email, "phone": d.phone,
+        "availableDays": d.available_days.split(","),
+        "startTime": d.start_time, "endTime": d.end_time,
+        "slotDurationMin": d.slot_duration_min,
+    } for d in doctors]
+
+
+@app.get("/doctors/{doctor_id}/slots")
+async def get_doctor_slots(doctor_id: int, date: Optional[str] = None, db: Session = Depends(get_db)):
+    """Get available slots for a doctor on a given date"""
+    doctor = db.query(DoctorDB).filter(DoctorDB.id == doctor_id).first()
+    if not doctor:
+        raise HTTPException(status_code=404, detail="Doctor not found")
+
+    # Generate time slots based on doctor schedule
+    from datetime import time as dtime
+    start_h, start_m = map(int, doctor.start_time.split(":"))
+    end_h, end_m = map(int, doctor.end_time.split(":"))
+    duration = doctor.slot_duration_min
+
+    slots = []
+    current_min = start_h * 60 + start_m
+    end_min = end_h * 60 + end_m
+
+    # Get booked slots for this date
+    booked_times = set()
+    if date:
+        booked = db.query(AppointmentDB).filter(
+            AppointmentDB.dentist == doctor.name,
+            AppointmentDB.appointment_date == date,
+            AppointmentDB.status.notin_(["Cancelled", "No-Show"])
+        ).all()
+        booked_times = {a.slot_time for a in booked}
+
+    while current_min + duration <= end_min:
+        h = current_min // 60
+        m = current_min % 60
+        period = "AM" if h < 12 else "PM"
+        display_h = h if h <= 12 else h - 12
+        if display_h == 0:
+            display_h = 12
+        slot_str = f"{display_h}:{m:02d} {period}"
+        slots.append({
+            "time": slot_str,
+            "available": slot_str not in booked_times,
+            "duration": f"{duration} min"
+        })
+        current_min += duration
+
+    return {"doctor": doctor.name, "date": date or "any", "slots": slots}
+
+
+# ============================================================================
+# SMART RESCHEDULING ENGINE
+# ============================================================================
+
+class RescheduleRequest(BaseModel):
+    appointment_id: int
+    preferred_time: str = "any"   # morning / afternoon / evening / any
+    preferred_date_from: Optional[str] = None
+    preferred_date_to: Optional[str] = None
+
+@app.post("/appointments/{apt_id}/reschedule-options")
+async def get_reschedule_options(apt_id: int, request: RescheduleRequest, db: Session = Depends(get_db)):
+    """
+    Smart Rescheduling: Returns top 3 alternative slots ranked by:
+    - Patient preference match
+    - Predicted attendance probability (inverse of risk)
+    - Proximity to original appointment
+    """
+    apt = db.query(AppointmentDB).filter(AppointmentDB.id == apt_id).first()
+    if not apt:
+        raise HTTPException(status_code=404, detail="Appointment not found")
+
+    # Generate candidate slots (next 14 days)
+    from datetime import date, timedelta
+    today = date.today()
+    candidates = []
+
+    time_preferences = {
+        "morning": ["9:00 AM", "9:30 AM", "10:00 AM", "10:30 AM", "11:00 AM", "11:30 AM"],
+        "afternoon": ["1:00 PM", "1:30 PM", "2:00 PM", "2:30 PM", "3:00 PM", "3:30 PM"],
+        "evening": ["4:00 PM", "4:30 PM", "5:00 PM"],
+        "any": ["9:00 AM", "10:00 AM", "11:00 AM", "2:00 PM", "3:00 PM", "4:00 PM"],
+    }
+    preferred_slots = time_preferences.get(request.preferred_time, time_preferences["any"])
+
+    for day_offset in range(1, 15):
+        candidate_date = today + timedelta(days=day_offset)
+        date_str = candidate_date.strftime("%Y-%m-%d")
+        day_name = candidate_date.strftime("%A")
+
+        # Skip weekends for standard scheduling
+        if day_name in ["Saturday", "Sunday"]:
+            continue
+
+        for slot_time in preferred_slots:
+            # Check if slot is already booked
+            existing = db.query(AppointmentDB).filter(
+                AppointmentDB.dentist == apt.dentist,
+                AppointmentDB.appointment_date == date_str,
+                AppointmentDB.slot_time == slot_time,
+                AppointmentDB.status.notin_(["Cancelled", "No-Show"])
+            ).first()
+
+            if not existing:
+                # Score this slot
+                pref_score = 1.0 if slot_time in preferred_slots else 0.5
+                # Proximity score: closer dates score higher
+                proximity_score = max(0, 1.0 - (day_offset / 14))
+                # Attendance score: use inverse of patient's risk
+                attendance_score = max(0, 1.0 - (apt.risk_score / 100))
+
+                total_score = (pref_score * 0.4) + (attendance_score * 0.4) + (proximity_score * 0.2)
+
+                candidates.append({
+                    "date": date_str,
+                    "dayName": day_name,
+                    "displayDate": candidate_date.strftime("%B %d, %Y"),
+                    "time": slot_time,
+                    "doctor": apt.dentist,
+                    "procedure": apt.procedure_type,
+                    "score": round(total_score * 100),
+                    "attendanceProbability": round(attendance_score * 100),
+                    "label": f"{day_name}, {candidate_date.strftime('%B %d')} at {slot_time}"
+                })
+
+    # Sort by score and return top 3
+    candidates.sort(key=lambda x: x["score"], reverse=True)
+    top3 = candidates[:3]
+
+    return {
+        "originalAppointment": {
+            "id": apt.id, "patient": apt.patient_name,
+            "procedure": apt.procedure_type, "dentist": apt.dentist,
+            "currentSlot": f"{apt.appointment_date} {apt.slot_time}"
+        },
+        "suggestedSlots": top3,
+        "message": f"Found {len(top3)} alternative slots based on your preferences and predicted attendance."
+    }
+
+
+@app.post("/appointments/{apt_id}/confirm-reschedule")
+async def confirm_reschedule(apt_id: int, new_date: str, new_time: str, db: Session = Depends(get_db)):
+    """Apply the rescheduled slot to the appointment"""
+    apt = db.query(AppointmentDB).filter(AppointmentDB.id == apt_id).first()
+    if not apt:
+        raise HTTPException(status_code=404, detail="Appointment not found")
+
+    old_slot = f"{apt.appointment_date} {apt.slot_time}"
+    apt.appointment_date = new_date
+    apt.slot_time = new_time
+    apt.status = "Scheduled"
+    apt.confirmation_status = "Pending"
+    apt.reminder_24h_sent = False
+    apt.reminder_2h_sent = False
+    apt.updated_at = datetime.now()
+    db.commit()
+
+    # Log notification
+    notif = NotificationLogDB(
+        appointment_id=apt_id,
+        patient_name=apt.patient_name,
+        patient_contact=apt.patient_email or apt.patient_phone,
+        channel="System",
+        notification_type="Rescheduled",
+        message=f"Appointment rescheduled from {old_slot} to {new_date} {new_time}",
+        status="Sent"
+    )
+    db.add(notif)
+    db.commit()
+
+    return {"message": "Appointment rescheduled successfully", "newSlot": f"{new_date} {new_time}"}
+
+
+# ============================================================================
+# RISK-BASED RESPONSE LOGIC
+# ============================================================================
+
+@app.post("/appointments/{apt_id}/apply-risk-response")
+async def apply_risk_response(apt_id: int, db: Session = Depends(get_db)):
+    """
+    Apply smart risk-based response logic:
+    - LOW (0-39%): Confirm instantly
+    - MEDIUM (40-69%): Schedule reminders at T-24h and T-2h
+    - HIGH (70%+): Request double confirmation + optional deposit
+    """
+    apt = db.query(AppointmentDB).filter(AppointmentDB.id == apt_id).first()
+    if not apt:
+        raise HTTPException(status_code=404, detail="Appointment not found")
+
+    risk = apt.risk_score
+    actions_taken = []
+
+    if risk < 40:
+        # LOW RISK: Confirm instantly
+        apt.status = "Confirmed"
+        apt.confirmation_status = "Confirmed"
+        actions_taken.append("Appointment auto-confirmed (low risk)")
+        notif_type = "AutoConfirmed"
+        message = f"Hi {apt.patient_name}, your appointment with {apt.dentist} is confirmed. See you soon!"
+
+    elif risk < 70:
+        # MEDIUM RISK: Keep scheduled, flag for reminders
+        apt.status = "Scheduled"
+        actions_taken.append("Reminders scheduled for T-24h and T-2h")
+        notif_type = "ReminderScheduled"
+        message = f"Hi {apt.patient_name}, your appointment is confirmed. We'll send you a reminder 24 hours before."
+
+    else:
+        # HIGH RISK: Request double confirmation + deposit
+        apt.status = "Scheduled"
+        apt.deposit_required = True
+        actions_taken.append("Double confirmation requested")
+        actions_taken.append("Deposit requirement flagged")
+        notif_type = "DoubleConfirmRequired"
+        message = f"Hi {apt.patient_name}, please confirm your appointment with {apt.dentist}. Reply YES to confirm or NO to cancel."
+
+    apt.updated_at = datetime.now()
+    db.commit()
+
+    # Log the notification
+    notif = NotificationLogDB(
+        appointment_id=apt_id,
+        patient_name=apt.patient_name,
+        patient_contact=apt.patient_email or apt.patient_phone,
+        channel="SMS",
+        notification_type=notif_type,
+        message=message,
+        status="Sent"
+    )
+    db.add(notif)
+    db.commit()
+
+    return {
+        "appointmentId": apt_id,
+        "riskScore": risk,
+        "riskCategory": apt.risk_category,
+        "actionsTaken": actions_taken,
+        "notificationSent": message,
+        "depositRequired": apt.deposit_required,
+    }
+
+
+@app.post("/appointments/{apt_id}/patient-confirm")
+async def patient_confirm_appointment(apt_id: int, confirmed: bool, db: Session = Depends(get_db)):
+    """Patient confirms or declines their appointment"""
+    apt = db.query(AppointmentDB).filter(AppointmentDB.id == apt_id).first()
+    if not apt:
+        raise HTTPException(status_code=404, detail="Appointment not found")
+
+    if confirmed:
+        apt.confirmation_status = "Confirmed"
+        apt.status = "Confirmed"
+        message = "Appointment confirmed. See you soon!"
+    else:
+        apt.confirmation_status = "Declined"
+        apt.status = "Cancelled"
+        message = "Appointment cancelled. Slot released to waitlist."
+        # Notify waitlist
+        _notify_waitlist_for_slot(apt.dentist, apt.slot_time, apt.procedure_type, db)
+
+    apt.updated_at = datetime.now()
+    db.commit()
+
+    return {"message": message, "status": apt.status, "confirmationStatus": apt.confirmation_status}
+
+
+def _notify_waitlist_for_slot(dentist: str, slot_time: str, procedure_type: str, db: Session):
+    """Internal: notify first waitlist patient when a slot opens"""
+    waitlist_entry = db.query(WaitlistDB).filter(
+        WaitlistDB.status == "Waiting",
+        WaitlistDB.procedure_type == procedure_type
+    ).order_by(WaitlistDB.created_at).first()
+
+    if waitlist_entry:
+        waitlist_entry.status = "Notified"
+        waitlist_entry.notified_at = datetime.now()
+        db.commit()
+
+        notif = NotificationLogDB(
+            patient_name=waitlist_entry.patient_name,
+            patient_contact=waitlist_entry.patient_email or waitlist_entry.patient_phone,
+            channel="SMS",
+            notification_type="WaitlistAlert",
+            message=f"Hi {waitlist_entry.patient_name}! A slot opened with {dentist} at {slot_time}. Reply BOOK to claim it within 15 minutes.",
+            status="Sent"
+        )
+        db.add(notif)
+        db.commit()
+
+
+# ============================================================================
+# WAITLIST ENDPOINTS
+# ============================================================================
+
+class WaitlistCreate(BaseModel):
+    patient_name: str
+    patient_email: str = ""
+    patient_phone: str = ""
+    procedure_type: str = "Cleaning"
+    preferred_dentist: str = "Any"
+    preferred_time: str = "any"
+    preferred_date_from: str = ""
+    preferred_date_to: str = ""
+
+@app.post("/waitlist")
+async def join_waitlist(data: WaitlistCreate, db: Session = Depends(get_db)):
+    """Add patient to waitlist"""
+    entry = WaitlistDB(
+        patient_name=data.patient_name,
+        patient_email=data.patient_email,
+        patient_phone=data.patient_phone,
+        procedure_type=data.procedure_type,
+        preferred_dentist=data.preferred_dentist,
+        preferred_time=data.preferred_time,
+        preferred_date_from=data.preferred_date_from,
+        preferred_date_to=data.preferred_date_to,
+        status="Waiting",
+        created_at=datetime.now()
+    )
+    db.add(entry)
+    db.commit()
+    db.refresh(entry)
+
+    position = db.query(WaitlistDB).filter(
+        WaitlistDB.status == "Waiting",
+        WaitlistDB.procedure_type == data.procedure_type,
+        WaitlistDB.id <= entry.id
+    ).count()
+
+    return {
+        "id": entry.id,
+        "message": f"Added to waitlist. You are #{position} in queue for {data.procedure_type}.",
+        "position": position,
+        "estimatedWait": f"{position * 2}-{position * 5} days"
+    }
+
+@app.get("/waitlist")
+async def get_waitlist(status: Optional[str] = None, db: Session = Depends(get_db)):
+    """Get all waitlist entries"""
+    q = db.query(WaitlistDB)
+    if status:
+        q = q.filter(WaitlistDB.status == status)
+    entries = q.order_by(WaitlistDB.created_at).all()
+    return [{
+        "id": e.id, "patientName": e.patient_name, "procedureType": e.procedure_type,
+        "preferredDentist": e.preferred_dentist, "preferredTime": e.preferred_time,
+        "status": e.status, "createdAt": e.created_at.isoformat() if e.created_at else None,
+        "notifiedAt": e.notified_at.isoformat() if e.notified_at else None,
+    } for e in entries]
+
+@app.delete("/waitlist/{entry_id}")
+async def leave_waitlist(entry_id: int, db: Session = Depends(get_db)):
+    """Remove from waitlist"""
+    entry = db.query(WaitlistDB).filter(WaitlistDB.id == entry_id).first()
+    if not entry:
+        raise HTTPException(status_code=404, detail="Waitlist entry not found")
+    db.delete(entry)
+    db.commit()
+    return {"message": "Removed from waitlist"}
+
+
+# ============================================================================
+# NOTIFICATION LOG ENDPOINTS
+# ============================================================================
+
+@app.get("/notifications")
+async def get_notifications(appointment_id: Optional[int] = None, limit: int = 50, db: Session = Depends(get_db)):
+    """Get notification history"""
+    q = db.query(NotificationLogDB)
+    if appointment_id:
+        q = q.filter(NotificationLogDB.appointment_id == appointment_id)
+    logs = q.order_by(NotificationLogDB.sent_at.desc()).limit(limit).all()
+    return [{
+        "id": l.id, "appointmentId": l.appointment_id, "patientName": l.patient_name,
+        "channel": l.channel, "type": l.notification_type, "message": l.message,
+        "status": l.status, "sentAt": l.sent_at.isoformat() if l.sent_at else None,
+    } for l in logs]
+
+
+# ============================================================================
+# ENHANCED ANALYTICS
+# ============================================================================
+
+@app.get("/analytics/no-show-trends")
+async def get_no_show_trends(db: Session = Depends(get_db)):
+    """No-show rate by procedure type and risk category"""
+    all_apts = db.query(AppointmentDB).all()
+    if not all_apts:
+        return {"message": "No data yet", "trends": {}}
+
+    by_procedure = {}
+    by_risk = {"Low": {"total": 0, "noshow": 0}, "Medium": {"total": 0, "noshow": 0}, "High": {"total": 0, "noshow": 0}}
+
+    for a in all_apts:
+        proc = a.procedure_type or "Unknown"
+        if proc not in by_procedure:
+            by_procedure[proc] = {"total": 0, "noshow": 0, "confirmed": 0}
+        by_procedure[proc]["total"] += 1
+        if a.status == "No-Show":
+            by_procedure[proc]["noshow"] += 1
+        if a.status == "Confirmed":
+            by_procedure[proc]["confirmed"] += 1
+
+        cat = a.risk_category or "Low"
+        if cat in by_risk:
+            by_risk[cat]["total"] += 1
+            if a.status == "No-Show":
+                by_risk[cat]["noshow"] += 1
+
+    # Calculate rates
+    for proc in by_procedure:
+        t = by_procedure[proc]["total"]
+        by_procedure[proc]["noShowRate"] = round(by_procedure[proc]["noshow"] / t * 100, 1) if t > 0 else 0
+        by_procedure[proc]["confirmRate"] = round(by_procedure[proc]["confirmed"] / t * 100, 1) if t > 0 else 0
+
+    for cat in by_risk:
+        t = by_risk[cat]["total"]
+        by_risk[cat]["noShowRate"] = round(by_risk[cat]["noshow"] / t * 100, 1) if t > 0 else 0
+
+    return {
+        "byProcedure": by_procedure,
+        "byRiskCategory": by_risk,
+        "totalAppointments": len(all_apts),
+        "overallNoShowRate": round(sum(1 for a in all_apts if a.status == "No-Show") / len(all_apts) * 100, 1)
+    }
+
+
+@app.get("/analytics/waitlist-stats")
+async def get_waitlist_stats(db: Session = Depends(get_db)):
+    """Waitlist analytics"""
+    entries = db.query(WaitlistDB).all()
+    return {
+        "total": len(entries),
+        "waiting": sum(1 for e in entries if e.status == "Waiting"),
+        "notified": sum(1 for e in entries if e.status == "Notified"),
+        "booked": sum(1 for e in entries if e.status == "Booked"),
+        "byProcedure": {p: sum(1 for e in entries if e.procedure_type == p) for p in set(e.procedure_type for e in entries)},
+    }
+
 
 # ── Run ───────────────────────────────────────────────────────────────────────
 
